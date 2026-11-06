@@ -1,0 +1,32 @@
+# Day 1: PostgreSQL + Redis only. No Prom/Loki/Tempo yet (Spec §12 Day 1).
+# The API runs on the host (`py -3.12 -m uvicorn apps.api.main:app`) — no api service here.
+#
+# Host-calibration note (Spec §3.1): explicit CPU/memory limits make container
+# utilization a well-defined ratio for F04/F05, but on Docker Desktop
+# (Windows/WSL2) container metrics are noisier than on native Linux. Calibrate
+# CPU thresholds on the same host that records the benchmark snapshots and
+# record the host configuration with each dataset version.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel
+    ports:
+      - "5432:5432"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
