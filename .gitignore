@@ -49,3 +49,7 @@ _tmp_*.py
 # API keys / provider tokens (defensive; .env already ignored)
 *.key
 *.pem
+
+# Serialized sklearn bundles (trained offline, never commit artifacts)
+*.pkl
+*.joblib

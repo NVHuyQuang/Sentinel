@@ -11,6 +11,8 @@ dependencies = [
     "pydantic>=2",
     "fastapi",
     "httpx",
+    "joblib",
+    "scikit-learn>=1.4",
 ]
 
 [project.optional-dependencies]
