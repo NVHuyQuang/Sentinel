@@ -5,7 +5,13 @@ Runs on top of every provider — model output never bypasses it.
 
 from typing import Literal
 
-from services.decision_engine.providers.base import TriageDecision
+from services.decision_engine.providers.base import (
+    DecisionProvider,
+    IncidentFeatures,
+    ProviderError,
+    TriageDecision,
+)
+from services.decision_engine.providers.rules import RulesProvider, rule_severity
 
 _SEVERITY_RANK = {"SEV1": 4, "SEV2": 3, "SEV3": 2, "SEV4": 1}
 
@@ -34,3 +40,24 @@ def enforce_severity_floor(
     if _SEVERITY_RANK[rule_severity] > _SEVERITY_RANK[decision.severity]:
         return decision.model_copy(update={"severity": rule_severity})
     return decision
+
+
+async def triage_with_fallback(
+    features: IncidentFeatures,
+    primary: DecisionProvider,
+    fallback: DecisionProvider | None = None,
+) -> TriageDecision:
+    """Try the primary provider (Laya); on ProviderError return rules.
+
+    No manual step: timeout, malformed or any other ProviderError from the
+    primary transparently returns fallback.triage (rules by default).
+    enforce_severity_floor applies after whichever provider won, and rule
+    severity can only raise. should_investigate stays with the caller.
+    """
+    if fallback is None:
+        fallback = RulesProvider()
+    try:
+        decision = await primary.triage(features)
+    except ProviderError:
+        decision = await fallback.triage(features)
+    return enforce_severity_floor(decision, rule_severity(features))
