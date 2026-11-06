@@ -32,6 +32,18 @@ evaluation/
 docs/spike_glide_*
 docs/spike_joey_*
 docs/spike_onejev_*
+# Local experiment/tuning outputs (scope creep beyond Spike 0/1 — keep local only).
+docs/ablation_*.json
+docs/benchmark_*_summary*.json
+docs/eval_*
+docs/golden_*
+docs/tuning_*.json
+scripts/compare_*.py
+scripts/eval_all.py
+scripts/golden_*.py
+scripts/read_spec.py
+scripts/spike_joey.py
+scripts/spike_onejev.py
 _tmp_*.py
 
 # API keys / provider tokens (defensive; .env already ignored)
