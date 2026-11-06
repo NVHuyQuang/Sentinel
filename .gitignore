@@ -14,3 +14,14 @@ env/
 .ruff_cache/
 
 *.log
+
+# Raw provider dumps / spike artifacts with machine-specific paths & tokens.
+# Never commit. Use docs/*-contract.md summaries as evidence instead.
+omniroute-models.json
+docs/spike_laya_*
+docs/spike_omniroute_*
+_tmp_*.py
+
+# API keys / provider tokens (defensive; .env already ignored)
+*.key
+*.pem
