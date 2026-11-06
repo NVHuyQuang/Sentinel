@@ -20,6 +20,18 @@ env/
 omniroute-models.json
 docs/spike_laya_*
 docs/spike_omniroute_*
+# Golden benchmark raw dumps (machine-specific, large); summaries/reports are committed instead.
+docs/benchmark_*_samples-*.jsonl
+# Local model weights / scope-creep dirs (GB-scale, never commit).
+GLiDE-0.4B/
+OneJev-0.8B/
+OneJev-0.8B-GGUF/
+joey-1/
+evaluation/
+# Other local spike raw artifacts (summaries/contracts stay committable).
+docs/spike_glide_*
+docs/spike_joey_*
+docs/spike_onejev_*
 _tmp_*.py
 
 # API keys / provider tokens (defensive; .env already ignored)
