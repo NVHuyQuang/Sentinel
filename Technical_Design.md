@@ -8,7 +8,7 @@ Implementation-ready design
 
 Research prototype
 
-This specification defines Sentinel as a hybrid AIOps platform combining conventional anomaly detection, Laya-based System One decisions (running on localhost), and LLM-based System Two investigation (DeepSeek via proxy server).
+This specification defines Sentinel as a hybrid AIOps platform combining conventional anomaly detection, Laya-based System One decisions (running on localhost), and LLM-based System Two investigation through the self-hosted OmniRoute gateway.
 
 The objective is to produce a technically credible, reproducible AI engineering portfolio project—not a generic monitoring dashboard with an LLM attached.
 
@@ -20,7 +20,7 @@ The objective is to produce a technically credible, reproducible AI engineering 
 | Autonomy                      | Autonomous detection and investigation; recommendations only |
 | Research focus                | Hybrid ML + System One + System Two                          |
 | Fast decision model           | Laya (running on localhost, behind a provider abstraction)   |
-| Reasoning model               | DeepSeek via proxy server                                    |
+| Reasoning model               | OmniRoute local gateway with configurable routed models      |
 | Agent orchestration           | LangGraph                                                    |
 | Backend                       | Python 3.12 + FastAPI                                        |
 | Frontend                      | Next.js + TypeScript                                         |
@@ -106,7 +106,7 @@ There are three separate control planes.
 
 Observability plane: Collects telemetry and exposes read-only queries. This plane does not invoke LLMs.
 
-Intelligence plane: Processes signals, calls Laya (localhost) or alternative decision providers, and performs investigation with DeepSeek via proxy server.
+Intelligence plane: Processes signals, calls Laya (localhost) or alternative decision providers, and performs investigation through the local OmniRoute OpenAI-compatible gateway.
 
 Application plane: Manages incident state, API requests, users, audit trails, dashboards, and experiment results.
 
@@ -122,7 +122,7 @@ The simulated environment should resemble a small e-commerce backend, because it
 | ------------------ | --------------------------------------- | ---------------------------------- |
 | API Gateway        | Routes incoming requests                | Auth, Orders                       |
 | Auth Service       | Authentication and token validation     | PostgreSQL                         |
-| Order Service      | Order creation and retrieval            | PostgreSQL, Payment                |
+| Order Service      | Order creation and retrieval            | PostgreSQL, Payment, Redis (read cache) |
 | Payment Service    | Simulated payment processing            | Redis, External Provider Simulator |
 | Provider Simulator | Configurable downstream API             | None                               |
 | PostgreSQL         | Application persistence                 | None                               |
@@ -133,6 +133,10 @@ The simulated environment should resemble a small e-commerce backend, because it
 All services should expose `/health`, `/ready`, and `/metrics` where appropriate.
 
 Use OpenTelemetry propagation for requests crossing service boundaries.
+
+The Fault Controller and Traffic Generator are test harness components, not monitored services. They must be excluded from the service allowlist, from `get_service_dependencies`, and from every telemetry stream the agent can query (see 3.3 sanitization rules).
+
+Container metrics: CPU and memory utilization (F04/F05) come from cAdvisor, added to the Compose stack and scraped by Prometheus, with application-level process metrics (for example `process_cpu_seconds_total`, `process_resident_memory_bytes`) as a cross-check. Each simulated service must run with explicit CPU and memory limits so that utilization is a well-defined ratio. On Docker Desktop (Windows/WSL2), container metrics are noisier than on native Linux; calibrate CPU thresholds on the same host that records the benchmark snapshots and record the host configuration with each dataset version.
 
 ## 3.2 Observability requirements
 
@@ -183,20 +187,32 @@ Ensure the agent can correlate logs with traces using trace IDs.
 
 Implement six deterministic scenarios.
 
-| ID  | Fault                               | Expected observable symptoms                    |
-| --- | ----------------------------------- | ----------------------------------------------- |
-| F01 | Database connection pool exhaustion | Higher query wait time, API latency, timeouts   |
-| F02 | Downstream provider slowdown        | Payment latency, dependency timeouts            |
-| F03 | Application regression              | Increased 500 errors after simulated deployment |
-| F04 | CPU saturation                      | Higher CPU, increased response latency          |
-| F05 | Memory pressure                     | Memory growth, degraded service responsiveness  |
-| F06 | Cache unavailability                | Cache errors, database load increase            |
+| ID  | Fault                               | Primary target (default)          | Allowed alternate targets | Expected observable symptoms                    |
+| --- | ----------------------------------- | --------------------------------- | ------------------------- | ----------------------------------------------- |
+| F01 | Database connection pool exhaustion | Order Service DB pool             | Auth Service DB pool      | Higher query wait time, API latency, timeouts   |
+| F02 | Downstream provider slowdown        | Provider Simulator (seen via Payment) | none                  | Payment latency, dependency timeouts            |
+| F03 | Application regression              | Order Service (new release)       | Payment Service           | Increased 500 errors after a deployment event   |
+| F04 | CPU saturation                      | Payment Service                   | Order Service             | Higher CPU, increased response latency          |
+| F05 | Memory pressure                     | Auth Service                      | Order Service             | Memory growth, degraded service responsiveness  |
+| F06 | Cache unavailability                | Redis (seen via Order Service read cache) | Redis (seen via Payment) | Cache errors, database load increase       |
+
+The "Affected service" run variation in 9.2 chooses only among the listed primary and alternate targets, so every fault has a defined, physically meaningful causal chain. Example chain for F01: pool max lowered or connections held, then Order Service pool utilization at 100%, then query wait time rises, then Order latency and timeouts, then Gateway 5xx.
 
 Fault injection must operate only on the isolated demo environment. No real production endpoints or external services should be affected.
 
 For each scenario, store a private ground-truth manifest containing the actual fault, onset time, affected services, expected causal chain, and recovery time.
 
 Do not expose that manifest to the investigation agents. The benchmark runner uses it only after an investigation is complete.
+
+### Telemetry sanitization rules (anti-leakage)
+
+Telemetry must contain only what a real environment would emit. Fault injection must never label itself in anything the agents can read.
+
+- No log line, metric name, label, span attribute, container name, environment variable, or service name may contain terms such as `fault`, `inject`, `chaos`, `scenario`, `F01`-`F06`, `ground_truth`, or `simulated_fault`.
+- Faults act through realistic mechanisms (lowered pool size, held connections, CPU burn, memory leak, stopped Redis, latency added in the Provider Simulator) and produce only the natural symptoms of those mechanisms.
+- Deployment events come from a release-pipeline record (service, version, timestamp, change summary written as a normal release note). F03 is an actual behavior change behind that new version, not a flag called "regression".
+- The Fault Controller writes its manifest to a store the agent tools cannot reach, and emits no telemetry into Prometheus, Loki, or Tempo.
+- CI check: grep every recorded snapshot and every tool response fixture for the forbidden terms above and fail the build on any hit.
 
 # 4. Data processing and anomaly detection
 
@@ -213,8 +229,28 @@ Each evaluation produces a normalized feature vector.
 
 ## 4.2 Feature schema
 
-```
-from pydantic import BaseModel, Fieldfrom datetime import datetimeclass ServiceSignalWindow(BaseModel):    service: str    window_start: datetime    window_end: datetime    request_rate: float = Field(ge=0)    error_rate: float = Field(ge=0, le=1)    latency_p50_ms: float = Field(ge=0)    latency_p95_ms: float = Field(ge=0)    latency_p99_ms: float = Field(ge=0)    cpu_utilization: float = Field(ge=0, le=1)    memory_utilization: float = Field(ge=0, le=1)    db_pool_utilization: float | None = None    dependency_timeout_rate: float | None = None    recent_deployment: bool = False    log_error_count: int = 0    trace_error_count: int = 0
+```python
+from datetime import datetime
+
+from pydantic import BaseModel, Field
+
+
+class ServiceSignalWindow(BaseModel):
+    service: str
+    window_start: datetime
+    window_end: datetime
+    request_rate: float = Field(ge=0)
+    error_rate: float = Field(ge=0, le=1)
+    latency_p50_ms: float = Field(ge=0)
+    latency_p95_ms: float = Field(ge=0)
+    latency_p99_ms: float = Field(ge=0)
+    cpu_utilization: float = Field(ge=0, le=1)
+    memory_utilization: float = Field(ge=0, le=1)
+    db_pool_utilization: float | None = None
+    dependency_timeout_rate: float | None = None
+    recent_deployment: bool = False
+    log_error_count: int = 0
+    trace_error_count: int = 0
 ```
 
 Missing telemetry must remain explicitly missing. Do not silently replace unavailable metrics with zero.
@@ -233,7 +269,7 @@ The configurations above are starting hypotheses, not empirically optimized sett
 
 ### Ensemble score
 
-For the MVP, normalize each detector output to a comparable 0–1 scale using a held-out calibration dataset.
+For the MVP, normalize each detector output to a comparable 0–1 scale using the dedicated Calibration split (normal-only runs, see 9.2). Isolation Forest is fit and baselines are estimated on the Training split only; the Validation split is used only to choose thresholds, and the Test split is never touched during tuning.
 
 Then compute:
 
@@ -263,13 +299,22 @@ A suggested initial grouping window is 3 minutes.
 
 The system should create one incident containing multiple correlated signals rather than opening separate incidents for every abnormal metric.
 
+## 4.5 Incident lifecycle and closing
+
+Status flow: `open` → `triaged` → `investigating` → `investigated` | `inconclusive` → `closed`.
+
+- Auto-resolve: an incident gets `resolved_at` when no member service has an active anomaly (ensemble score below the clear threshold and no critical rule firing) for 5 consecutive minutes (10 evaluations at 30 seconds). The clear threshold is lower than the trigger threshold (hysteresis).
+- Re-open: a new anomaly on a member service within the 3-minute grouping window of the last signal merges into the existing incident instead of opening a new one. After `resolved_at`, a new anomaly within 10 minutes re-opens the same incident; later anomalies open a new one.
+- `closed` is set only after `resolved_at` is set and the investigation has finished (or been skipped by policy). Closing never triggers any operational action.
+- An investigation running when the incident resolves still runs to completion; its report records that the incident resolved during investigation.
+
 # 5. System One — Laya integration specification
 
 The System One layer should be a replaceable decision subsystem, not a hard dependency embedded throughout the application.
 
 ## 5.1 Decision responsibilities
 
-Laya (running locally on localhost) receives an incident candidate and makes structured triage decisions.
+Laya (running locally on localhost) receives an `IncidentFeatures` object (an incident candidate aggregated across all correlated signals and services, see 5.2) and makes structured triage decisions. Laya and the cloud LLM baseline (T3) are evaluated zero-shot with the same choice/criteria schema; any few-shot or prompt variant must be applied identically to both and recorded in the experiment configuration.
 
 | Decision               | Type             | Output                                                        |
 | ---------------------- | ---------------- | ------------------------------------------------------------- |
@@ -281,34 +326,72 @@ Laya (running locally on localhost) receives an incident candidate and makes str
 
 Treat these as predictions, not authoritative facts.
 
-For severity, define operational rules first:
+For severity, define operational rules first. Core services are API Gateway, Auth, Order, and Payment. Thresholds are provisional and are tuned only on the Validation split.
 
-| Severity | Meaning                                     |
-| -------- | ------------------------------------------- |
-| SEV1     | Critical simulated service unavailability   |
-| SEV2     | Major degradation affecting core operations |
-| SEV3     | Partial degradation or elevated errors      |
-| SEV4     | Low-impact anomaly requiring observation    |
+| Severity | Meaning                                     | Deterministic rule (evaluated on the 1-minute window, sustained for at least 2 consecutive evaluations) |
+| -------- | ------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| SEV1     | Critical simulated service unavailability   | API Gateway error_rate ≥ 50%, or any core service failing `/ready` for ≥ 60 s                          |
+| SEV2     | Major degradation affecting core operations | Any core service error_rate ≥ 20%, or P95 latency ≥ 5× its baseline median                             |
+| SEV3     | Partial degradation or elevated errors      | Any service error_rate ≥ 5%, or P95 latency ≥ 2× its baseline median                                   |
+| SEV4     | Low-impact anomaly requiring observation    | Anomaly candidate that meets none of the rules above                                                    |
 
-The policy engine must be able to override a model decision when deterministic evidence indicates a critical incident.
+Severity ground-truth labels for the benchmark are assigned from an `impact_level` field in the scenario manifest, set when the scenario is designed. They are never computed from the observed metrics by these same rules; otherwise the rule-based baseline (T0) would score perfectly by construction.
+
+The policy engine must be able to override a model decision when deterministic evidence indicates a critical incident (a SEV1 or SEV2 rule firing raises the severity to at least that level; it never lowers it).
 
 ## 5.2 Provider abstraction
 
 Use a typed interface:
 
 ```
-from typing import Protocolfrom pydantic import BaseModel, Fieldclass TriageDecision(BaseModel):    category: str    severity: str    priority_score: float = Field(ge=0, le=1)    investigate: bool    deployment_relevant: bool | None = None    provider: str    model_version: str | None = None    raw_scores: dict[str, float] = {}class DecisionProvider(Protocol):    async def triage(        self,        features: ServiceSignalWindow    ) -> TriageDecision:        ...
+from datetime import datetime
+from typing import Literal, Protocol
+
+from pydantic import BaseModel, Field
+
+
+class IncidentFeatures(BaseModel):
+    """Aggregated input for triage. Built from detector output only; never contains ground truth."""
+
+    candidate_id: str
+    opened_at: datetime
+    primary_service: str
+    affected_services: list[str]
+    windows: list[ServiceSignalWindow]  # latest 1-min and 5-min window per affected service
+    detector_scores: dict[str, float]  # statistical / isolation / change_point
+    anomaly_score: float = Field(ge=0, le=1)
+    critical_rule_triggered: bool = False
+    deployment_services: list[str] = []  # services with a deployment in the context window
+    dependency_edges: list[tuple[str, str]] = []  # observed caller -> callee among affected services
+    symptom_tags: list[str] = []  # e.g. "latency_up", "error_up", "pool_saturated"
+
+
+class TriageDecision(BaseModel):
+    category: Literal["LATENCY", "ERROR_SPIKE", "RESOURCE", "DEPENDENCY", "UNKNOWN"]
+    severity: Literal["SEV1", "SEV2", "SEV3", "SEV4"]
+    priority_score: float = Field(ge=0, le=1)
+    investigate: bool
+    deployment_relevant: bool | None = None
+    provider: str
+    model_version: str | None = None
+    latency_ms: float | None = None
+    raw_scores: dict[str, float] = {}
+
+
+class DecisionProvider(Protocol):
+    async def triage(self, features: IncidentFeatures) -> TriageDecision:
+        ...  # raise ProviderError on timeout/invalid output so the policy layer can fall back
 ```
 
 Implement four providers:
 
 ```
-decision_providers/
-├── base.py
+services/decision_engine/providers/
+├── base.py      # DecisionProvider, TriageDecision, IncidentFeatures, ProviderError
 ├── laya.py
-├── sklearn_classifier.py
-├── llm_classifier.py
-└── rule_based.py
+├── sklearn.py
+├── llm.py       # OmniRoute structured output (T3)
+└── rules.py
 ```
 
 All providers must return the same `TriageDecision` schema.
@@ -317,7 +400,7 @@ All providers must return the same `TriageDecision` schema.
 
 The Laya adapter should:
 
-1. Receive a validated feature vector.
+1. Receive a validated `IncidentFeatures` object.
 2. Format the feature vector into structured incident text and question schemas (choices and criteria for category, severity, and urgency).
 3. Query the local Laya model instance running on localhost (via in-process router or localhost inference endpoint).
 4. Parse the returned decisions and scores.
@@ -335,12 +418,34 @@ Critical fallback rule: If Laya is unavailable on localhost, Sentinel must remai
 A suggested policy:
 
 ```
-def should_investigate(    decision: TriageDecision,    anomaly_score: float,    critical_rule_triggered: bool,) -> bool:    if critical_rule_triggered:        return True    if decision.severity in {"SEV1", "SEV2"}:        return True    if anomaly_score >= 0.85:        return True    return (        decision.investigate        and decision.priority_score >= 0.65    )
+def should_investigate(
+    decision: TriageDecision,
+    anomaly_score: float,
+    critical_rule_triggered: bool,
+) -> bool:
+    if critical_rule_triggered:
+        return True
+    if decision.severity in {"SEV1", "SEV2"}:
+        return True
+    if anomaly_score >= 0.85:
+        return True
+    return decision.investigate and decision.priority_score >= 0.65
 ```
 
 Thresholds are provisional and should be tuned on validation scenarios.
 
 The policy should additionally enforce deduplication, cooldowns, and maximum concurrent investigations.
+
+### 5.4 Laya integration contract (Spike 0, blocking)
+
+The adapter details above are intent, not a verified contract. Before any Laya code beyond a stub, produce `docs/laya-contract.md` from a real call against the local instance and answer:
+
+- How Laya is invoked (in-process library or localhost HTTP endpoint), its version, and how it is started in Docker Compose or on the host.
+- The exact request format (input text, choice/criteria schema, maximum input length) and the exact response format (labels, scores, whether scores are probabilities, logits, or uncalibrated).
+- Whether output is deterministic for the same input, and the measured P50/P95 latency on CPU and, if available, GPU.
+- Failure modes (timeout, malformed output, out-of-vocabulary choices) and how each maps to `ProviderError`.
+
+Pass criteria: 50 representative `IncidentFeatures` samples return parseable output for all five decisions, latency is recorded, and killing the Laya process makes the system fall back to `rules.py` with no manual action. Until this passes, T2 and H2 are marked blocked in the experiment plan; the provider interface stays unchanged and the other providers continue to work.
 
 # 6. System Two — Multi-agent investigation
 
@@ -357,7 +462,18 @@ This is preferable to an unrestricted swarm of agents because the investigation 
 - Auditable evidence.
 - Reproducible evaluation.
 
-The supervisor should be application code. Individual reasoning agents use DeepSeek (connected via the proxy server) for structured reasoning, hypothesis formation, evidence verification, and RCA synthesis.
+The supervisor should be application code. Individual reasoning agents use OmniRoute through its local OpenAI-compatible endpoint for structured reasoning, hypothesis formation, evidence verification, and RCA synthesis. OmniRoute handles the configured upstream providers and routing strategy; Sentinel must not call an upstream model API directly.
+
+The default local configuration is:
+
+```
+LLM_PROVIDER=omniroute
+LLM_BASE_URL=http://localhost:20128/v1
+LLM_MODEL=auto/deepseek
+LLM_API_KEY=local-omniroute
+```
+
+`LLM_MODEL` may be changed to another OmniRoute route such as `auto/best-free` for development or `auto/cheap` for cost-sensitive runs. The selected route and resolved upstream model must be recorded for every experiment.
 
 ## 6.2 Agent contracts
 
@@ -403,8 +519,23 @@ Restriction: Must distinguish verified facts from hypotheses and acknowledge unc
 
 ## 6.3 Investigation state
 
-```
-from typing import TypedDictclass InvestigationState(TypedDict):    incident_id: str    service: str    severity: str    context: dict    hypotheses: list[dict]    evidence: list[dict]    iteration: int    tool_calls: int    selected_hypothesis_id: str | None    rca_report: dict | None    status: str    errors: list[str]
+```python
+from typing import TypedDict
+
+
+class InvestigationState(TypedDict):
+    incident_id: str
+    service: str
+    severity: str
+    context: dict
+    hypotheses: list[dict]
+    evidence: list[dict]
+    iteration: int
+    tool_calls: int
+    selected_hypothesis_id: str | None
+    rca_report: dict | None
+    status: str
+    errors: list[str]
 ```
 
 For production-quality implementation, replace generic dictionaries with dedicated Pydantic models at the API and persistence boundaries.
@@ -450,13 +581,27 @@ The orchestrator should stop when a limit is reached and produce an incomplete o
 
 Define the following tools:
 
-```
-query_metrics(    service: str,    metric: str,    start: datetime,    end: datetime)query_logs(    service: str,    start: datetime,    end: datetime,    level: str | None = None,    limit: int = 100)query_traces(    service: str,    start: datetime,    end: datetime,    errors_only: bool = False)get_deployment_events(    service: str,    start: datetime,    end: datetime)get_service_dependencies(    service: str)search_historical_incidents(    query: str,    limit: int = 5)
+```python
+def query_metrics(
+    service: str, metric: str, start: datetime, end: datetime
+): ...
+def query_logs(
+    service: str, start: datetime, end: datetime,
+    level: str | None = None, limit: int = 100
+): ...
+def query_traces(
+    service: str, start: datetime, end: datetime, errors_only: bool = False
+): ...
+def get_deployment_events(service: str, start: datetime, end: datetime): ...
+def get_service_dependencies(service: str): ...
+def search_historical_incidents(query: str, limit: int = 5): ...
 ```
 
 Every tool must enforce server-side service allowlists, time-range limits, query limits, and timeouts.
 
 Do not let the LLM submit arbitrary PromQL, LogQL, SQL, or shell commands directly. Build queries from validated parameters in trusted application code.
+
+All tools read through a `TelemetryBackend` interface with two implementations: `LiveBackend` (Prometheus, Loki, Tempo) and `SnapshotBackend` (a recorded, timestamped snapshot on disk, see 10). The agent code and tool code are identical in both modes; only the backend is injected. This is what makes recorded replay and fair model comparison possible.
 
 # 7. Data contracts and database schema
 
@@ -483,16 +628,52 @@ The ground-truth table should be accessible only to the benchmark evaluator, not
 
 ## 7.2 Incident API schema
 
-```
-from enum import Enumfrom uuid import UUIDfrom datetime import datetimefrom pydantic import BaseModelclass IncidentStatus(str, Enum):    OPEN = "open"    TRIAGED = "triaged"    INVESTIGATING = "investigating"    INVESTIGATED = "investigated"    INCONCLUSIVE = "inconclusive"    CLOSED = "closed"class Incident(BaseModel):    id: UUID    service_id: UUID    status: IncidentStatus    category: str    severity: str    anomaly_score: float    opened_at: datetime    updated_at: datetime    triage_decision_id: UUID | None = None    investigation_id: UUID | None = None
+```python
+from datetime import datetime
+from enum import Enum
+from uuid import UUID
+
+from pydantic import BaseModel
+
+
+class IncidentStatus(str, Enum):
+    OPEN = "open"
+    TRIAGED = "triaged"
+    INVESTIGATING = "investigating"
+    INVESTIGATED = "investigated"
+    INCONCLUSIVE = "inconclusive"
+    CLOSED = "closed"
+
+
+class Incident(BaseModel):
+    id: UUID
+    service_id: UUID
+    status: IncidentStatus
+    category: str
+    severity: str
+    anomaly_score: float
+    opened_at: datetime
+    updated_at: datetime
+    triage_decision_id: UUID | None = None
+    investigation_id: UUID | None = None
 ```
 
 ## 7.3 Evidence schema
 
 Every factual claim in the RCA must point to evidence.
 
-```
-class Evidence(BaseModel):    id: UUID    investigation_id: UUID    source_type: str    service: str    observation: str    timestamp: datetime    source_reference: str    query_parameters: dict    supports: list[str]    contradicts: list[str]
+```python
+class Evidence(BaseModel):
+    id: UUID
+    investigation_id: UUID
+    source_type: str
+    service: str
+    observation: str
+    timestamp: datetime
+    source_reference: str
+    query_parameters: dict
+    supports: list[str]
+    contradicts: list[str]
 ```
 
 `source_reference` should be an immutable reference to the retrieved result or stored snapshot, not an invented citation.
@@ -502,8 +683,30 @@ For reproducibility, store the query parameters, retrieval timestamp, result che
 ## 7.4 RCA report schema
 
 ```
-class RCAReport(BaseModel):    incident_id: UUID    summary: str    affected_services: list[str]    probable_root_cause: str | None    confidence_level: str    supporting_evidence_ids: list[UUID]    contradicting_evidence_ids: list[UUID]    timeline: list[dict]    alternative_hypotheses: list[dict]    recommendations: list[str]    unresolved_questions: list[str]    investigation_complete: bool
+class Claim(BaseModel):
+    id: str
+    text: str
+    kind: Literal["fact", "inference", "hypothesis"]
+    evidence_ids: list[UUID]  # required non-empty when kind == "fact"
+
+
+class RCAReport(BaseModel):
+    incident_id: UUID
+    summary: str
+    affected_services: list[str]
+    probable_root_cause: str | None
+    confidence_level: Literal["low", "medium", "high"]
+    claims: list[Claim]  # every statement in summary/timeline/root cause is expressed as a claim
+    supporting_evidence_ids: list[UUID]
+    contradicting_evidence_ids: list[UUID]
+    timeline: list[dict]  # each entry references claim ids
+    alternative_hypotheses: list[dict]
+    recommendations: list[str]
+    unresolved_questions: list[str]
+    investigation_complete: bool
 ```
+
+Validation before persistence: reject (retry once, then fail explicitly) any report where a `fact` claim has no `evidence_ids`, an evidence ID does not exist for this investigation, or the claim text is not supported by the referenced evidence observation. "100% of factual claims linked to evidence" is measured on `claims` of kind `fact`; prose outside `claims` is not allowed in the persisted report.
 
 Use `confidence_level` values such as `low`, `medium`, and `high` initially. Do not present uncalibrated LLM self-assessment as a statistically meaningful probability.
 
@@ -558,7 +761,7 @@ Planned evaluation dataset composition.
 
 Planned benchmark: 36 positive incident runs, six per fault category.
 
-Also generate at least 12 normal or non-incident runs, including workload spikes that should not automatically become incidents.
+Also generate normal or non-incident runs (32 in total across the splits below), including workload spikes that should not automatically become incidents. The Training split adds 48 positive runs on top of the 36 evaluation runs; the "36 held-out" figure refers to the Development, Validation, and Test splits only.
 
 Each run should vary:
 
@@ -573,11 +776,15 @@ Each run should vary:
 
 To avoid leakage, separate scenarios by configuration and random seed, not by individual telemetry windows.
 
-| Split       | Positive runs | Normal runs | Purpose                      |
-| ----------- | ------------- | ----------- | ---------------------------- |
-| Development | 12            | 4           | Implementation and debugging |
-| Validation  | 12            | 4           | Threshold tuning             |
-| Test        | 12            | 4           | Final evaluation             |
+| Split       | Positive runs | Normal runs | Purpose                                                          |
+| ----------- | ------------- | ----------- | ---------------------------------------------------------------- |
+| Training    | 48            | 12          | Fit Isolation Forest/baselines and the Random Forest triage (T1) |
+| Calibration | 0             | 8           | Detector score normalization (normal-only)                       |
+| Development | 12            | 4           | Implementation and debugging                                     |
+| Validation  | 12            | 4           | Threshold tuning                                                 |
+| Test        | 12            | 4           | Final evaluation                                                 |
+
+The Training split exists because 12 positive runs are too few to train T1 for five categories and four severities without overfitting. Runs are generated from the scenario generator, so extra runs are cheap; all splits use disjoint configurations and seeds. Laya and the cloud LLM baseline use no training data (zero-shot, see 5.1).
 
 For stronger evidence, repeat the final evaluation across multiple seeds after the MVP. The initial test set is small, so results should be reported with uncertainty rather than presented as definitive superiority.
 
@@ -615,8 +822,8 @@ Use the same normalized incident features for all decision providers.
 | ------- | ----------------------------------------------- | ----------------------------------------------- |
 | T0      | Rule-based                                      | Deterministic baseline                          |
 | T1      | Random Forest                                   | Conventional supervised ML                      |
-| T2      | Laya (localhost)                                | System One fast decision model                  |
-| T3      | DeepSeek structured output (via proxy)          | Cloud LLM classification baseline               |
+| T2      | Laya (localhost) **[BLOCKED — pending Spike 0, §5.4]** | System One fast decision model                  |
+| T3      | OmniRoute `auto/deepseek` structured output     | Routed LLM classification baseline              |
 
 Measure:
 
@@ -643,7 +850,9 @@ Compare four configurations:
 | R2      | Multi-agent investigation                   |
 | R3      | Multi-agent + historical incident retrieval |
 
-Keep the model (DeepSeek via proxy), telemetry snapshot, available evidence, and total execution budget comparable.
+Keep the OmniRoute route, resolved model, telemetry snapshot, available evidence, and total execution budget comparable.
+
+LLM reproducibility: use the lowest-variance sampling settings the API offers (temperature 0 or the provider's recommended deterministic setting), record the exact model ID, prompt version, and parameters in `experiment_runs`, and cache every LLM response keyed by hash(model, parameters, prompt) so a benchmark can be re-run offline. Because low temperature does not guarantee identical output, run each variant on each test incident at least 3 times and report mean and spread (for example bootstrap confidence intervals), not single scores. With a 12-incident test set, differences between variants are reported as indicative, not conclusive.
 
 Evaluate:
 
@@ -664,10 +873,10 @@ This experiment tests the actual architecture.
 
 | Variant | Detection | Triage           | Investigation                  |
 | ------- | --------- | ---------------- | ------------------------------ |
-| H0      | Rules     | Rules            | Single LLM (DeepSeek via proxy)  |
-| H1      | Hybrid ML | Rules            | Multi-agent (DeepSeek via proxy) |
-| H2      | Hybrid ML | Laya (localhost) | Multi-agent (DeepSeek via proxy) |
-| H3      | Hybrid ML | Cloud LLM        | Multi-agent (DeepSeek via proxy) |
+| H0      | Rules     | Rules            | Single LLM (OmniRoute `auto/deepseek`)  |
+| H1      | Hybrid ML | Rules            | Multi-agent (OmniRoute `auto/deepseek`) |
+| H2      | Hybrid ML | Laya (localhost) **[BLOCKED — pending Spike 0, §5.4]** | Multi-agent (OmniRoute `auto/deepseek`) |
+| H3      | Hybrid ML | Cloud LLM        | Multi-agent (OmniRoute `auto/deepseek`) |
 
 For each variant, measure end-to-end detection-to-report time, RCA success rate, false investigations, LLM calls, and cost.
 
@@ -685,7 +894,7 @@ These are engineering targets, not expected research results.
 | Incident detection recall        | ≥ 80% on test incidents                       |
 | False alert rate                 | Reported and compared with baseline           |
 | RCA category accuracy            | ≥ 70% on investigated test incidents          |
-| Evidence traceability            | 100% of factual RCA claims linked to evidence |
+| Evidence traceability            | 100% of `fact` claims in `RCAReport.claims` link to existing, supporting evidence |
 | Invalid structured outputs       | Under 2% after validation/retry               |
 | Investigation timeout compliance | 100%                                          |
 | Unauthorized remediation actions | 0                                             |
@@ -718,6 +927,8 @@ Live simulation: Recreates the fault in Docker and captures telemetry in real ti
 
 Recorded replay: Loads a previously captured, timestamped telemetry snapshot. This mode is essential for fair model comparisons because every model sees identical evidence.
 
+Snapshot format: one directory per run containing metrics (Parquet, one file per metric with timestamp, labels, value), logs (JSON Lines), traces (JSON Lines of spans), deployment events, the service dependency map, a `meta.json` (dataset version, generator config hash, seed, host configuration, schema version), and a checksum manifest. The ground-truth manifest is stored outside the snapshot directory. `SnapshotBackend` serves the tool queries from these files, applying the same allowlists, time-range limits, and result limits as `LiveBackend`, and is only allowed to return data up to the investigation's "now" so the agent cannot read the future. The recorder writes snapshots from the live Prometheus/Loki/Tempo stack after the sanitization check in 3.3 passes.
+
 For the initial benchmark, prioritize recorded replay. Live simulation is useful for demonstrations but introduces environmental variance.
 
 # 11. Implementation repository structure
@@ -747,6 +958,11 @@ sentinel/
 │   │   │   └── rules.py
 │   │   ├── policy.py
 │   │   └── calibration.py
+│   │
+│   ├── telemetry/
+│   │   ├── backend.py        # TelemetryBackend interface
+│   │   ├── live.py           # Prometheus / Loki / Tempo
+│   │   └── snapshot.py       # recorded replay
 │   │
 │   ├── investigation/
 │   │   ├── graph.py
@@ -857,6 +1073,15 @@ API health endpoint, PostgreSQL and Redis operational
 
 &#x20;PreviousNext day&#x20;
 
+## Pre-implementation spikes (before Day 1 coding)
+
+Half a day, blocking. Each spike ends with a short note in `docs/` and a pass/fail result.
+
+1. Laya contract: see 5.4.
+2. OmniRoute contract: confirm the local endpoint (`http://localhost:20128/v1`), configured route (default `auto/deepseek`), model discovery behavior, JSON/structured output behavior and failure rate, tool-calling support and its limits, routing fallbacks, rate limits and timeouts, context window, token/cost reporting, and which sampling parameters are honored.
+3. Telemetry round-trip: write 10 sample metrics, logs, and traces through the stack, record them with the snapshot format from 10, and read them back through `SnapshotBackend` with identical results.
+4. Container metrics: confirm cAdvisor reports per-container CPU and memory under Docker Desktop on this host, and that F04/F05 produce a visible signal.
+
 ## Scope control and fallback plan
 
 If implementation falls behind schedule, prioritize the following order:
@@ -878,7 +1103,7 @@ A working, measured three-scenario pipeline is more valuable than a six-scenario
 | Test level  | Focus                                                                |
 | ----------- | -------------------------------------------------------------------- |
 | Unit        | Feature aggregation, anomaly scoring, decision mapping, policy logic |
-| Contract    | Laya adapter, DeepSeek proxy structured outputs, telemetry tools     |
+| Contract    | Laya adapter, OmniRoute structured outputs, telemetry tools           |
 | Integration | Prometheus/Loki/Tempo queries, PostgreSQL, Redis                     |
 | Agent       | State transitions, tool budgets, malformed responses                 |
 | End-to-end  | Fault injection → detection → triage → RCA                           |
@@ -968,7 +1193,7 @@ Sentinel is a hybrid AIOps research prototype combining:
 
 - Traditional ML for anomaly detection.
 - Laya (running on localhost) as a System One fast decision provider.
-- DeepSeek (via proxy server) as a System Two reasoning model.
+- OmniRoute local gateway with `auto/deepseek` as the default System Two reasoning route.
 - LangGraph for autonomous incident investigation.
 - OpenTelemetry, Prometheus, Loki, and Tempo for observability.
 - Docker Compose for reproducible simulated infrastructure.
@@ -999,14 +1224,14 @@ Then expand functionality.
 ## Initial tasks
 
 1. Create `docs/architecture.md`.
-2. Create `docs/technical-spec.md`.
+2. Create `docs/api-spec.md`.
 3. Create `docs/agent-design.md`.
 4. Create `docs/experiments.md`.
 5. Create `docs/security.md`.
 6. Define Pydantic contracts.
 7. Define the database schema.
 8. Define API contracts.
-9. Verify Laya local runtime / localhost endpoint availability and integration requirements.
+9. Run Spike 0: verify the Laya localhost runtime and write `docs/laya-contract.md` (see 5.4), and verify the OmniRoute contract (see the spike list in section 12).
 10. Produce a dependency-aware implementation plan.
 
 Use `CLAUDE.md` to document architectural rules, repository conventions, commands, and testing requirements.
