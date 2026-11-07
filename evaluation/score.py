@@ -54,6 +54,9 @@ def evaluate(manifest: dict, backend: SnapshotBackend, run: RunResult, primary: 
         verdict["closed"] = hit.status == "closed"
         if hit.resolved_at:
             rep["resolve_delay_after_recovery_s"] = _secs(hit.resolved_at, recovery)
+        if inv:
+            rep["investigation"] = {"outcome": inv.outcome, "error": inv.error,
+                                    "tool_calls": len(inv.trace), **inv.extras}
         rca = inv.report if inv else None
         verdict["rca_produced"] = rca is not None
         if rca:
@@ -62,11 +65,16 @@ def evaluate(manifest: dict, backend: SnapshotBackend, run: RunResult, primary: 
             cited = {e for c in facts for e in c.evidence_ids}
             rel = {tuple(x) for x in exp["relevant_signals"]}
             by_id = {e.id: e for e in inv.evidence}
-            good = [e for e in cited if (by_id[e].service,
-                    by_id[e].query_parameters.get("metric") or by_id[e].source_type) in rel]
+            def key(e):
+                return (e.service, e.query_parameters.get("metric") or e.source_type)
+
+            good = [e for e in cited if key(by_id[e]) in rel]
+            retrieved = {key(e) for e in inv.evidence}
             rep["rca"] = {"root_cause": rca.probable_root_cause, "confidence": rca.confidence_level,
                           "claims": len(rca.claims), "fact_claims": len(facts),
                           "evidence_precision": len(good) / len(cited) if cited else 0.0,
+                          "evidence_recall": len(retrieved & rel) / len(rel),
+                          "evidence_retrieved": len(inv.evidence),
                           "tool_calls": len(inv.trace), "marker": inv.marker,
                           "recommendations": rca.recommendations}
             verdict["root_cause_match"] = all(k.lower() in text for k in exp["root_cause_keywords"])
@@ -95,8 +103,14 @@ def render_markdown(r: dict) -> str:
         a = r["rca"]
         lines.append(f"- RCA ({a['marker']}): {a['root_cause']} [{a['confidence']}], "
                      f"{a['fact_claims']} fact claims, "
-                     f"evidence precision {a['evidence_precision']:.2f}, "
+                     f"evidence precision {a['evidence_precision']:.2f} recall "
+                     f"{a['evidence_recall']:.2f}, "
                      f"{a['tool_calls']} tool calls")
+    if "investigation" in r:
+        i = r["investigation"]
+        lines.append(f"- investigation: {i['outcome']}" + (f" ({i['error']})" if i["error"] else "")
+                     + f", {i.get('duration_s')} s, calls/round {i.get('calls_per_round')}, "
+                     f"llm {i.get('llm')}")
     lines += ["", "## Causal chain (observed, seconds after onset)"]
     lines += [f"- {c['stage']}: {c['after_onset_s']}" for c in r["chain"]]
     lines += ["", "## Verdict (gating)"] + [f"- {k}: {'PASS' if ok else 'FAIL'}" for k, ok in v.items()]

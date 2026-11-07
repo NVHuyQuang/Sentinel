@@ -8,7 +8,7 @@ policy.triage_with_fallback -> should_investigate -> investigation -> auto-resol
 This module never imports the simulator or the ground-truth store.
 """
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -19,7 +19,7 @@ from services.decision_engine.providers.base import (
     ServiceSignalWindow,
     TriageDecision,
 )
-from services.investigation.stub import InvestigationResult
+from services.investigation.graph import InvestigationResult
 from services.signal_processor.detectors import (
     CusumDetector,
     IsolationForestDetector,
@@ -93,7 +93,8 @@ async def run_pipeline(
     detectors: dict[str, ServiceDetectors],
     primary: DecisionProvider,
     fallback: DecisionProvider | None,
-    investigate: Callable[[SnapshotBackend, str, IncidentFeatures], InvestigationResult],
+    investigate: Callable[[SnapshotBackend, str, IncidentFeatures],
+                          Awaitable[InvestigationResult]],
 ) -> RunResult:
     grouper = IncidentGrouper()
     gate = CandidateGate()
@@ -149,7 +150,7 @@ async def run_pipeline(
             if should_investigate(dec, feats.anomaly_score, feats.critical_rule_triggered):
                 grouper.transition(inc.incident_id, "investigating", now)
                 log(now, "investigation_started", incident=inc.incident_id)
-                out = investigate(view, inc.incident_id, feats)
+                out = await investigate(view, inc.incident_id, feats)
                 res.investigations[inc.incident_id] = out
                 grouper.complete_investigation(inc.incident_id, out.outcome)
                 log(now, "investigation_done", incident=inc.incident_id, outcome=out.outcome,

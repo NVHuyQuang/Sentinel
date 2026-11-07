@@ -3,6 +3,7 @@
     py -3.12 -m evaluation.f01_runner                 # record fresh snapshots, then run
     py -3.12 -m evaluation.f01_runner --replay        # reuse snapshots in evaluation/work
     py -3.12 -m evaluation.f01_runner --primary laya  # real Laya (needs checkpoint/device)
+    py -3.12 -m evaluation.f01_runner --replay --repeats 3   # needs OMNIROUTE_API_KEY
 
 The hidden manifest is read only after the pipeline (and its investigation) has finished.
 """
@@ -17,7 +18,8 @@ from pathlib import Path
 from evaluation.score import evaluate, render_markdown
 from services.decision_engine.providers.laya import LayaAdapter
 from services.decision_engine.providers.rules import RulesProvider
-from services.investigation.stub import investigate
+from services.investigation.graph import SystemTwo
+from services.investigation.llm import ChatClient
 from services.pipeline import fit_detectors, run_pipeline
 from services.telemetry.backend import SnapshotBackend
 from simulator.fault_controller import GroundTruthStore
@@ -60,14 +62,26 @@ def make_primary(kind: str, device: str):
     return LayaAdapter(device="cpu", timeout_ms=5000, router=StubLayaRouter())
 
 
+def default_investigator(work: Path) -> SystemTwo:
+    # Cold OmniRoute calls take 39-72 s each, so 180 s cannot hold for uncached runs.
+    return SystemTwo(ChatClient(cache_dir=work / "llm_cache"), deadline_s=600.0)
+
+
 def record_all(work: Path) -> None:
     record_snapshot(work / "train", SimConfig(seed=TRAIN_SEED, duration_s=3000))
     record_snapshot(work / "test", SimConfig(seed=TEST_SEED, onset_s=600),
                     GroundTruthStore(work / "ground_truth"), RUN_ID)
 
 
-async def run(work: Path, out: Path, primary_kind: str = "stub-laya", device: str = "cuda") -> dict:
-    """Replay the snapshots in `work` (record_all must have run; it owns its own event loop)."""
+async def run(work: Path, out: Path, primary_kind: str = "stub-laya", device: str = "cuda",
+              investigator: SystemTwo | None = None) -> dict:
+    """Replay the snapshots in `work` (record_all must have run; it owns its own event loop).
+
+    Default investigator is System Two over OmniRoute (needs OMNIROUTE_API_KEY and the gateway;
+    otherwise every investigation ends inconclusive and the report says so).
+    """
+    investigator = investigator or default_investigator(work)
+    investigate = investigator.investigate
     train = SnapshotBackend(work / "train")
     test = SnapshotBackend(work / "test")
     primary = make_primary(primary_kind, device)
@@ -88,12 +102,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--primary", choices=["stub-laya", "laya", "rules"], default="stub-laya")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--replay", action="store_true")
+    ap.add_argument("--repeats", type=int, default=1,
+                    help="run N times; with the LLM cache on, repeats are cache-assisted")
     a = ap.parse_args(argv)
     if not a.replay:
         record_all(a.work)
-    report = asyncio.run(run(a.work, a.out, a.primary, a.device))
-    print(render_markdown(report))
-    return 0 if report["verdict"]["all_pass"] else 1
+    reports = [asyncio.run(run(a.work, a.out, a.primary, a.device)) for _ in range(a.repeats)]
+    print(render_markdown(reports[-1]))
+    if a.repeats > 1:
+        secs = [r.get("investigation", {}).get("duration_s", 0.0) for r in reports]
+        print(f"repeats={a.repeats} pass={[r['verdict']['all_pass'] for r in reports]} "
+              f"investigation_s mean={sum(secs) / len(secs):.2f} min={min(secs)} max={max(secs)}")
+    return 0 if all(r["verdict"]["all_pass"] for r in reports) else 1
 
 
 if __name__ == "__main__":

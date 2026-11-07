@@ -1,7 +1,7 @@
 """RCA report validation (Spec 7.4): fact claims must link to real, supporting evidence."""
 
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from uuid import UUID
 
 from services.decision_engine.providers.base import Evidence, RCAReport
@@ -38,13 +38,18 @@ def validate_report(report: RCAReport, evidence: list[Evidence], investigation_i
         raise ReportValidationError("; ".join(errors))
 
 
-def finalize_report(generate: Callable[[], RCAReport], evidence: list[Evidence],
-                    investigation_id: UUID, retries: int = 1) -> RCAReport:
-    """Validate; retry generation once; then fail explicitly (never persist a bad report)."""
+async def finalize_report(generate: Callable[[str | None], Awaitable[RCAReport]],
+                          evidence: list[Evidence], investigation_id: UUID,
+                          retries: int = 1) -> RCAReport:
+    """Validate; regenerate once with the error as feedback; then fail explicitly.
+
+    `generate(error)` may itself raise ReportValidationError (e.g. a malformed claim); that
+    counts as a failed attempt. Provider errors propagate: the caller ends inconclusive.
+    """
     last: ReportValidationError | None = None
     for _ in range(retries + 1):
-        report = generate()
         try:
+            report = await generate(str(last) if last else None)
             validate_report(report, evidence, investigation_id)
             return report
         except ReportValidationError as exc:

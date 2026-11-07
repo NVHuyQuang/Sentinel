@@ -1,4 +1,4 @@
-"""F01 end to end on recorded replay: identical evidence every run (SnapshotBackend)."""
+"""F01 end to end on recorded replay with System Two (mocked LLM; identical evidence every run)."""
 
 import asyncio
 import json
@@ -11,19 +11,25 @@ from evaluation.score import evaluate
 from services.decision_engine.providers.base import ProviderError
 from services.decision_engine.providers.laya import LayaAdapter
 from services.decision_engine.providers.rules import RulesProvider
-from services.investigation.stub import investigate
+from services.investigation.graph import SystemTwo
+from services.investigation.llm import ChatClient
 from services.pipeline import fit_detectors, run_pipeline
 from services.telemetry.backend import SnapshotBackend
 from simulator.fault_controller import GroundTruthStore
+from tests.llm_doubles import ScriptedLLM
+
+
+def _laya():
+    return LayaAdapter(device="cpu", timeout_ms=5000, router=StubLayaRouter())
 
 
 @pytest.fixture(scope="module")
 def replay(work):
     train, test = SnapshotBackend(work / "train"), SnapshotBackend(work / "test")
-    laya = LayaAdapter(device="cpu", timeout_ms=5000, router=StubLayaRouter())
-    result = asyncio.run(
-        run_pipeline(test, fit_detectors(train), laya, RulesProvider(), investigate))
-    return test, result
+    llm = ScriptedLLM()
+    result = asyncio.run(run_pipeline(test, fit_detectors(train), _laya(), RulesProvider(),
+                                      SystemTwo(llm).investigate))
+    return test, result, llm
 
 
 def _manifest(work):
@@ -31,7 +37,7 @@ def _manifest(work):
 
 
 def test_detection_recall_and_delay(work, replay):
-    test, result = replay
+    test, result, _ = replay
     rep = evaluate(_manifest(work), test, result, "stub-laya")
     assert rep["verdict"]["detected"] and rep["verdict"]["no_false_positives"]
     assert rep["detection_delay_s"] <= 90
@@ -39,7 +45,7 @@ def test_detection_recall_and_delay(work, replay):
 
 
 def test_triage_routes_through_laya_with_severity_floor(replay):
-    _, result = replay
+    _, result, _ = replay
     (dec,) = result.triage.values()
     assert dec.provider == "laya"  # primary answered; stub Laya says SEV4
     assert dec.severity in ("SEV1", "SEV2")  # rule floor raised it (core error rate >= 0.2)
@@ -60,24 +66,33 @@ async def test_dead_primary_falls_back_to_rules(work):
 
     train, test = SnapshotBackend(work / "train"), SnapshotBackend(work / "test")
     laya = LayaAdapter(device="cpu", timeout_ms=5000, router=Dead())
-    result = await run_pipeline(test, fit_detectors(train), laya, RulesProvider(), investigate)
+    result = await run_pipeline(test, fit_detectors(train), laya, RulesProvider(),
+                                SystemTwo(ScriptedLLM()).investigate)
     (dec,) = result.triage.values()
     assert dec.provider == "rules" and dec.category == "RESOURCE"
 
 
-def test_rca_is_evidence_backed_and_matches_hidden_truth(work, replay):
-    test, result = replay
+def test_multi_agent_rca_matches_hidden_truth_and_records_cost(work, replay):
+    test, result, llm = replay
     (inv,) = result.investigations.values()
-    assert inv.outcome == "investigated" and len(inv.trace) <= 12
+    assert inv.outcome == "investigated"
+    assert inv.report.probable_root_cause == "Database connection pool exhaustion on order-service"
+    assert llm.roles == ["Context Collector", "Hypothesis Generator", "Evidence Investigator",
+                         "RCA Synthesizer"]
+    assert len(inv.trace) <= 30 and max(inv.extras["calls_per_round"].values()) <= 12
     ids = {e.id for e in inv.evidence}
     facts = [c for c in inv.report.claims if c.kind == "fact"]
     assert facts and all(c.evidence_ids and set(c.evidence_ids) <= ids for c in facts)
     rep = evaluate(_manifest(work), test, result, "stub-laya")
-    assert rep["verdict"]["root_cause_match"] and rep["advisory"]["evidence_precision_1"]
+    assert rep["verdict"]["root_cause_match"] and rep["verdict"]["facts_all_linked"]
+    assert rep["rca"]["evidence_precision"] == 1.0 and rep["rca"]["evidence_recall"] >= 0.8
+    i = rep["investigation"]
+    assert i["duration_s"] >= 0 and i["llm"]["prompt_tokens"] > 0 and i["llm"]["calls"] == 4
+    assert i["llm"]["route"] == "mock-route" and i["llm"]["cost"] == "not reported"
 
 
 def test_lifecycle_resolves_after_five_clean_minutes_and_closes(work, replay):
-    test, result = replay
+    test, result, _ = replay
     (inc,) = result.incidents
     assert inc.status == "closed" and inc.resolved_at is not None
     rep = evaluate(_manifest(work), test, result, "stub-laya")
@@ -97,7 +112,8 @@ def test_replay_is_identical_across_runs(work, tmp_path):
 
     async def once(root):
         train, test = SnapshotBackend(root / "train"), SnapshotBackend(root / "test")
-        res = await run_pipeline(test, fit_detectors(train), RulesProvider(), None, investigate)
+        res = await run_pipeline(test, fit_detectors(train), RulesProvider(), None,
+                                 SystemTwo(ScriptedLLM()).investigate)
         (inv,) = res.investigations.values()
         return inv.report.model_dump_json(), [e.model_dump_json() for e in inv.evidence]
 
@@ -112,24 +128,27 @@ async def test_ground_truth_read_only_after_investigation(work, monkeypatch):
         events.append("manifest_read")
         return real_read(self, run_id)
 
-    def spy_investigate(*a, **k):
-        out = investigate(*a, **k)
-        events.append("investigation_done")
-        return out
+    class Spy(SystemTwo):
+        async def investigate(self, *a, **k):
+            out = await super().investigate(*a, **k)
+            events.append("investigation_done")
+            return out
 
     monkeypatch.setattr(GroundTruthStore, "read", read)
-    monkeypatch.setattr(runner, "investigate", spy_investigate)
     out = work / "reports"
-    report = await runner.run(work, out)
+    report = await runner.run(work, out, investigator=Spy(ScriptedLLM()))
     assert events == ["investigation_done", "manifest_read"]
     assert report["verdict"]["all_pass"]
-    assert json.loads((out / "f01_report.json").read_text())["verdict"]["detected"]
-    assert (out / "f01_report.md").exists()
+    assert json.loads((out / "f01_report.json").read_text())["investigation"]["outcome"] == (
+        "investigated")
+    assert "investigation: investigated" in (out / "f01_report.md").read_text()
 
 
-def test_time_boxed_investigation_is_inconclusive(work, replay):
-    test, result = replay
-    feats = next(iter(result.features.values()))
-    ticks = iter([0.0] + [500.0] * 20)  # clock jumps past the 180 s cap after the first call
-    out = investigate(test.at(test.end), "inc-1", feats, clock=lambda: next(ticks))
-    assert out.outcome == "inconclusive" and out.report is None and "time budget" in out.error
+async def test_unreachable_omniroute_ends_inconclusive_and_report_says_so(work, tmp_path):
+    llm = ChatClient(api_key="k", base_url="http://127.0.0.1:9/v1", timeout_s=2.0)
+    report = await runner.run(work, tmp_path / "r", investigator=SystemTwo(llm))
+    assert report["investigation"]["outcome"] == "inconclusive"
+    assert "llm unavailable" in report["investigation"]["error"]
+    assert not report["verdict"]["rca_produced"] and not report["verdict"]["all_pass"]
+    assert "rca" not in report  # no canned root cause
+    assert "llm unavailable" in (tmp_path / "r" / "f01_report.md").read_text()

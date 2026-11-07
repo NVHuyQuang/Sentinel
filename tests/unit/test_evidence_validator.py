@@ -59,16 +59,16 @@ def test_hypothesis_may_have_no_evidence():
                                    evidence_ids=[])]), [_ev()], INV)
 
 
-def test_finalize_retries_once_then_fails_explicitly():
-    calls = []
+async def test_finalize_retries_once_with_feedback_then_fails_explicitly():
+    seen = []
 
-    def bad():
-        calls.append(1)
+    async def bad(error):
+        seen.append(error)
         return _report([Claim(id="c1", text="x", kind="fact", evidence_ids=[])])
 
     with pytest.raises(ReportValidationError, match="after 2 attempts"):
-        finalize_report(bad, [_ev()], INV)
-    assert len(calls) == 2
+        await finalize_report(bad, [_ev()], INV)
+    assert seen[0] is None and "fact without evidence" in seen[1]
 
 
 def test_toolbox_enforces_call_budget_and_deadline(work):
@@ -87,7 +87,8 @@ def test_toolbox_enforces_call_budget_and_deadline(work):
 def test_toolbox_has_no_remediation_tools():
     public = {n for n in dir(ToolBox) if not n.startswith("_")}
     assert public == {"query_metrics", "query_logs", "query_traces", "get_deployment_events",
-                      "get_service_dependencies", "record", "now"}
+                      "get_service_dependencies", "search_historical_incidents", "record", "now",
+                      "new_round", "calls", "time_left"}
 
 
 def test_backend_never_reads_the_future_and_enforces_limits(work, monkeypatch):

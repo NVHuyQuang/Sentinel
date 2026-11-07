@@ -13,6 +13,7 @@ dependencies = [
     "httpx",
     "joblib",
     "scikit-learn>=1.4",
+    "langgraph>=1.0",
 ]
 
 [project.optional-dependencies]
