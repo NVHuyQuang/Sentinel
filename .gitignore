@@ -27,7 +27,10 @@ GLiDE-0.4B/
 OneJev-0.8B/
 OneJev-0.8B-GGUF/
 joey-1/
-evaluation/
+evaluation/datasets/
+# Replay slice outputs: recorded snapshots, hidden manifests, generated reports.
+evaluation/work/
+evaluation/reports/
 # Other local spike raw artifacts (summaries/contracts stay committable).
 docs/spike_glide_*
 docs/spike_joey_*
@@ -53,3 +56,7 @@ _tmp_*.py
 # Serialized sklearn bundles (trained offline, never commit artifacts)
 *.pkl
 *.joblib
+
+# Recorded telemetry snapshots (regenerated deterministically from seed)
+snapshots/
+*.parquet
