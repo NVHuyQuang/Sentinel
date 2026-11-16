@@ -8,9 +8,15 @@ It is a test double only: it must never be wired into the runner.
 import asyncio
 import json
 import re
+from datetime import timedelta
 
-from services.decision_engine.providers.base import ProviderError
+from services.decision_engine.providers.base import (
+    IncidentFeatures,
+    ProviderError,
+    ServiceSignalWindow,
+)
 from services.investigation.llm import LLMReply
+from services.telemetry.backend import parse_ts
 
 _METRICS = ["db_pool_utilization", "db_query_wait_ms_p95", "latency_p95_ms", "error_rate",
             "cpu_utilization", "memory_utilization", "request_rate", "latency_p99_ms",
@@ -33,6 +39,7 @@ class ScriptedLLM:
         self.roles: list[str] = []
         self.rca_calls = 0
         self.more = 0
+        self.single = 0
         self.active = self.max_active = 0
 
     async def complete(self, system: str, user: str) -> LLMReply:
@@ -57,16 +64,32 @@ class ScriptedLLM:
     def _context_collector(self, user: str):
         if self.mode == "plain_text":
             return "I would start by looking at the database."
+        qs = self._queries()
+        if self.mode == "inject":
+            qs += [{"tool": "restart_service", "service": "order-service"},
+                   {"tool": "query_metrics", "service": "order-service", "metric": "x; DROP"}]
+        if self.mode == "history":
+            qs.append({"tool": "search_historical_incidents", "query": "pool"})
+        return {"queries": qs}
+
+    def _queries(self) -> list[dict]:
         qs = [{"tool": "query_metrics", "service": "order-service", "metric": m}
               for m in ("db_pool_utilization", "db_query_wait_ms_p95", "latency_p95_ms",
                         "error_rate")]
         qs += [{"tool": "query_metrics", "service": "api-gateway", "metric": "error_rate"},
                {"tool": "query_logs", "service": "order-service", "level": "ERROR"},
                {"tool": "get_service_dependencies", "service": "order-service"}]
-        if self.mode == "inject":
-            qs += [{"tool": "restart_service", "service": "order-service"},
-                   {"tool": "query_metrics", "service": "order-service", "metric": "x; DROP"}]
-        return {"queries": qs}
+        return qs
+
+    def _single_investigator(self, user: str):
+        self.single += 1
+        if self.single == 1:
+            qs = self._queries() + [{"tool": "query_metrics", "service": "order-service",
+                                     "metric": "cpu_utilization"}]
+            if self.mode == "history":
+                qs.append({"tool": "search_historical_incidents", "query": "pool"})
+            return {"queries": qs, "done": False}
+        return {"queries": [], "done": True}
 
     def _hypothesis_generator(self, user: str):
         pool = _with(user, "db_pool_utilization")
@@ -111,12 +134,31 @@ class ScriptedLLM:
                 claims.append({"text": ev[lab], "kind": "fact", "evidence": [lab]})
         if bad:
             claims.append({"text": "pool utilization was 0.42", "kind": "fact", "evidence": []})
+        cite = [c["evidence"][0] for c in claims[:2] if c["evidence"]] or ["E1"]
         claims.append({"text": "Pool saturation queued requests and timeouts reached the gateway",
-                       "kind": "inference", "evidence": [c["evidence"][0] for c in claims[:2]]})
+                       "kind": "inference", "evidence": cite})
         return {"summary": "Order DB pool saturated.",
                 "probable_root_cause": "Database connection pool exhaustion on order-service",
+                "root_cause_category": "RESOURCE_EXHAUSTION",
                 "confidence": "high", "claims": claims,
                 "alternative_hypotheses": [{"hypothesis": "cpu saturation",
                                             "status": "contradicted"}],
                 "recommendations": ["Inspect sessions holding connections."],
                 "unresolved_questions": ["Which session holds the connections?"]}
+
+
+NOW = parse_ts("2026-11-06T03:11:30Z")
+
+
+def _w(svc: str) -> ServiceSignalWindow:
+    return ServiceSignalWindow(
+        service=svc, window_start=NOW - timedelta(minutes=1), window_end=NOW, request_rate=15,
+        error_rate=0.4, latency_p50_ms=100, latency_p95_ms=2100, latency_p99_ms=2200,
+        cpu_utilization=0.3, memory_utilization=0.5)
+
+
+FEATURES = IncidentFeatures(
+    candidate_id="inc-1", opened_at=NOW, primary_service="order-service",
+    affected_services=["order-service", "api-gateway"],
+    windows=[_w("order-service"), _w("order-service"), _w("api-gateway"), _w("api-gateway")],
+    detector_scores={"statistical": 1.0}, anomaly_score=0.8, symptom_tags=["error_up"])

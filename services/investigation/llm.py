@@ -37,6 +37,7 @@ class LLMReply:
     usage: dict
     latency_ms: float
     cached: bool = False
+    response_id: str = ""  # gateway response id; repeats share it on a semantic-cache hit
 
 
 class LLM(Protocol):
@@ -54,6 +55,7 @@ class RunMeta:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     llm_latency_ms: float = 0.0
+    response_ids: list = field(default_factory=list)
 
     def add(self, r: LLMReply) -> None:
         self.route = r.model
@@ -63,12 +65,14 @@ class RunMeta:
         self.prompt_tokens += int(r.usage.get("prompt_tokens", 0))
         self.completion_tokens += int(r.usage.get("completion_tokens", 0))
         self.llm_latency_ms += r.latency_ms
+        self.response_ids.append(r.response_id)
 
     def as_dict(self) -> dict:
         return {"route": self.route, "resolved_upstream": sorted(self.resolved),
                 "temperature": 0, "calls": self.calls, "cache_hits": self.cache_hits,
                 "prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens,
-                "llm_latency_ms": round(self.llm_latency_ms, 1), "cost": "not reported"}
+                "llm_latency_ms": round(self.llm_latency_ms, 1), "cost": "not reported",
+                "response_ids": list(self.response_ids)}
 
 
 def parse_json_object(text: str) -> dict:
@@ -135,7 +139,8 @@ class ChatClient:
             raise ProviderError("malformed: content is not a string")
         reply = LLMReply(text=text, model=self.model, resolved_model=str(raw.get("model", "unknown")),
                          usage=raw.get("usage") or {},
-                         latency_ms=(time.perf_counter() - start) * 1000)
+                         latency_ms=(time.perf_counter() - start) * 1000,
+                         response_id=str(raw.get("id", "")))
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({**reply.__dict__, "cached": False}))

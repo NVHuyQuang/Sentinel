@@ -20,6 +20,7 @@ for cold runs.
 """
 
 import asyncio
+import hashlib
 import json
 import operator
 import re
@@ -49,9 +50,11 @@ from services.investigation.toolbox import (
     RoundBudgetExceeded,
     ToolBox,
     ToolBudgetExceeded,
+    ToolResult,
 )
 from services.telemetry.backend import METRIC_ALLOWLIST, QueryRejected, SnapshotBackend
 
+VARIANTS = ("R0", "R1", "R2", "R3")
 MAX_ROUNDS = 3
 MAX_HYPOTHESES = 3
 MAX_CONCURRENT = 3
@@ -111,10 +114,19 @@ class SystemTwo:
 
     def __init__(self, llm: LLM, max_concurrent: int = MAX_CONCURRENT,
                  deadline_s: float = DEADLINE_S, clock: Callable[[], float] = time.monotonic,
-                 max_calls: int = MAX_CALLS, round_max: int = ROUND_MAX) -> None:
+                 max_calls: int = MAX_CALLS, round_max: int = ROUND_MAX,
+                 variant: str = "R2", history: list[dict] | None = None) -> None:
+        if variant not in VARIANTS:
+            raise ValueError(f"variant must be one of {VARIANTS}")
         self.llm, self.deadline_s, self.clock = llm, deadline_s, clock
         self.max_calls, self.round_max = max_calls, round_max
+        self.variant, self.history = variant, history or []  # R3 only; empty store today
         self._sem = asyncio.Semaphore(max_concurrent)
+
+    def budget(self) -> dict:
+        """Execution budget; identical across variants by contract (a bigger one is a bug)."""
+        return {"max_calls": self.max_calls, "round_max": self.round_max,
+                "deadline_s": self.deadline_s, "max_rounds": MAX_ROUNDS}
 
     async def investigate(self, backend: SnapshotBackend, incident_id: str,
                           features: IncidentFeatures) -> InvestigationResult:
@@ -128,7 +140,11 @@ class _Run:
         self.s, self.backend, self.incident_id, self.features = s, backend, incident_id, features
         self.inv_id = uuid5(NAMESPACE_URL, f"{backend.snapshot_id}/investigation/{incident_id}")
         self.box = ToolBox(backend, self.inv_id, clock=s.clock, max_calls=s.max_calls,
-                           deadline_s=s.deadline_s, round_max=s.round_max)
+                           deadline_s=s.deadline_s, round_max=s.round_max,
+                           history=s.history if s.variant == "R3" else None)
+        self.history_on = s.variant == "R3"
+        self.root_category = "UNKNOWN"
+        self.rejections = 0
         self.meta = RunMeta()
         self.labels: dict[str, Evidence] = {}
         self.seen: set[str] = set()
@@ -149,8 +165,10 @@ class _Run:
             '{"tool":"query_logs","service":S,"level":"ERROR"|"WARN"|null} | '
             '{"tool":"query_traces","service":S,"errors_only":true|false} | '
             '{"tool":"get_deployment_events","service":S} | '
-            '{"tool":"get_service_dependencies","service":S} | '
-            '{"tool":"search_historical_incidents","query":"short text"}. '
+            '{"tool":"get_service_dependencies","service":S}'
+            + (' | {"tool":"search_historical_incidents","query":"short text"} (the store may '
+               'be empty)' if self.history_on else "")
+            + ". "
             f"S MUST be one of: {', '.join(sorted(self.backend.services))}. "
             f"M MUST be one of: {', '.join(sorted(METRIC_ALLOWLIST))}. "
             "Time range is fixed by the system to the last 10 minutes."
@@ -167,7 +185,7 @@ class _Run:
         tool, svc = q.get("tool"), q.get("service")
         ok = tool in ("query_metrics", "query_logs", "query_traces", "get_deployment_events",
                       "get_service_dependencies", "search_historical_incidents")
-        if not ok:
+        if not ok or (tool == "search_historical_incidents" and not self.history_on):
             return None
         if tool == "search_historical_incidents":
             return {"tool": tool, "query": clean(q.get("query", ""), 100)}
@@ -232,15 +250,27 @@ class _Run:
         return [x for x in (labels if isinstance(labels, list) else []) if x in self.labels]
 
     # -- agent nodes ----------------------------------------------------------------------
-    async def context(self, st: _State) -> _State:
+    def summary_lines(self) -> list[str]:
+        """The fixed incident summary every variant starts from (detector output only)."""
         f = self.features
         lines = [(f"incident {self.incident_id}: primary {f.primary_service}; affected "
-                 f"{', '.join(f.affected_services)}; anomaly_score {f.anomaly_score:.2f}; "
-                 f"symptoms {', '.join(f.symptom_tags) or 'none'}")]
+                  f"{', '.join(f.affected_services)}; anomaly_score {f.anomaly_score:.2f}; "
+                  f"symptoms {', '.join(f.symptom_tags) or 'none'}")]
         for w in f.windows[::2]:
             pool = "n/a" if w.db_pool_utilization is None else f"{w.db_pool_utilization:.2f}"
             lines.append(f"{w.service}: error_rate {w.error_rate:.3f} p95 "
                          f"{w.latency_p95_ms:.0f} ms cpu {w.cpu_utilization:.2f} db_pool {pool}")
+        return lines
+
+    def _record_summary(self) -> None:
+        """E1 in every variant: same starting evidence, citable, not a tool call."""
+        text = " | ".join(self.summary_lines())
+        sha = hashlib.sha256(text.encode()).hexdigest()
+        res = ToolResult("incident_summary", {}, [], sha, f"summary://{sha}")
+        self.labels["E1"] = self.box.record(res, "-", text, [], [])
+
+    async def context(self, st: _State) -> _State:
+        lines = self.summary_lines()
         try:
             reply = await self._ask(
                 "context",
@@ -362,14 +392,14 @@ class _Run:
 
     async def rca(self, st: _State) -> _State:
         sufficient = bool(st.get("sufficient"))
-        feedback = {"text": None}
 
         async def generate(error: str | None) -> RCAReport:
-            feedback["text"] = error
+            self.rejections += 1 if error else 0
             reply = await self._ask(
                 "rca",
                 "Role: RCA Synthesizer. Return {summary, probable_root_cause (one sentence naming "
-                "the failing component and mechanism, or null), confidence: low|medium|high, "
+                "the failing component and mechanism, or null), root_cause_category: one of "
+                + "|".join(CATEGORIES) + ", confidence: low|medium|high, "
                 'claims:[{"text","kind":"fact"|"inference"|"hypothesis","evidence":[labels]}], '
                 'alternative_hypotheses:[{"hypothesis","status"}], recommendations:[text only], '
                 "unresolved_questions:[at least one]}. Every fact claim MUST cite evidence labels "
@@ -393,6 +423,8 @@ class _Run:
             cited = list(dict.fromkeys(e for c in claims for e in c.evidence_ids))
             conf = d.get("confidence") if d.get("confidence") in ("low", "medium", "high") \
                 else "low"
+            self.root_category = d.get("root_cause_category") if d.get(
+                "root_cause_category") in CATEGORIES else "UNKNOWN"
             root = d.get("probable_root_cause") if isinstance(
                 d.get("probable_root_cause"), str) else None
             if not sufficient:  # never a confident answer on exhausted or unproven evidence
@@ -418,7 +450,10 @@ class _Run:
                     c.kind == "fact" for c in claims)))
 
         try:
-            report = await finalize_report(generate, list(self.labels.values()), self.inv_id)
+            if self.s.variant == "R0":  # R0 baseline: no evidence validator, one attempt
+                report = await generate(None)
+            else:
+                report = await finalize_report(generate, list(self.labels.values()), self.inv_id)
         except (ProviderError, ReportValidationError, ToolBudgetExceeded) as exc:
             return {"failed": f"rca: {exc}", "trace": [{"agent": "rca", "error": str(exc)}]}
         return {"report": report, "trace": [
@@ -438,7 +473,69 @@ class _Run:
             return END
         return "rca" if st.get("sufficient") or st.get("exhausted") else "hypotheses"
 
+    async def _single(self, tools: bool) -> _State:
+        """R0 (tools=False) and R1: one LLM, no role split, same budgets, validators and RCA."""
+        st: _State = {"trace": [], "sufficient": True, "hypotheses": None, "assessments": None}
+        for r in range(MAX_ROUNDS if tools else 0):
+            self.box.new_round()
+            try:
+                reply = await self._ask(
+                    "single",
+                    'Role: Single Investigator. Return {"queries":[...],"done":true|false}: name '
+                    "read-only queries to test what caused this incident, or done=true when the "
+                    "evidence is enough. " + self._catalog(),
+                    "Incident evidence so far:\n" + self._evidence_block())
+                try:
+                    obj = parse_json_object(reply.text)
+                    raw, done = obj.get("queries"), obj.get("done") is True
+                except ProviderError:
+                    raw, done = _free_text_queries(reply.text), False
+                queries = self._clean_queries(raw)
+                if r == 0 and not queries:
+                    raise ProviderError("single investigator produced no valid query")
+            except (ProviderError, ToolBudgetExceeded) as exc:
+                return {"failed": f"single: {exc}", "trace": [{"agent": "single", "error": str(exc)}]}
+            if done or not queries:
+                break
+            n, ex = self._execute(queries)
+            st["trace"].append({"agent": "single", "round": r + 1, "executed": n,
+                                "tool_calls_total": self.box.calls})
+            if ex:
+                st.update(exhausted=ex, sufficient=False)
+                break
+        else:
+            if tools:  # still asking for more after the last round
+                st.update(exhausted=f"round budget of {MAX_ROUNDS} reached", sufficient=False)
+        out = await self.rca(st)
+        st["trace"] = st["trace"] + out.pop("trace")
+        st.update(out)
+        return st
+
     async def go(self) -> InvestigationResult:
+        t0, v = self.s.clock(), self.s.variant
+        self._record_summary()
+        if v in ("R0", "R1"):
+            st = await self._single(v == "R1")
+        else:
+            st = await self._graph()
+        report, failed = st.get("report"), st.get("failed")
+        ok = bool(report and report.investigation_complete and not failed)
+        per_round: dict[int, int] = {}
+        for t in self.box.trace:
+            per_round[t["round"]] = per_round.get(t["round"], 0) + 1
+        return InvestigationResult(
+            self.incident_id, "investigated" if ok else "inconclusive", report,
+            list(self.labels.values()), self.box.trace,
+            error=failed or (None if ok else str(st.get("exhausted") or "evidence insufficient")),
+            marker=f"system-two-v1 {v} route={self.meta.route or 'n/a'}",
+            extras={"variant": v, "agent_trace": st["trace"], "calls_per_round": per_round,
+                    "duration_s": round(self.s.clock() - t0, 3), "llm": self.meta.as_dict(),
+                    "rejected_queries": self.rejected, "root_cause_category": self.root_category,
+                    "validator_rejections": self.rejections, "budget": self.s.budget(),
+                    "history": ("empty store" if v == "R3" and not self.s.history else
+                                "n/a" if v != "R3" else "provided")})
+
+    async def _graph(self) -> _State:
         g = StateGraph(_State)
         g.add_node("context", self.context)
         g.add_node("hypotheses", self.hypotheses)
@@ -451,19 +548,4 @@ class _Run:
         g.add_conditional_edges("investigator", self._after("gate"))
         g.add_conditional_edges("gate", self._after_gate)
         g.add_edge("rca", END)
-        t0 = self.s.clock()
-        st = await g.compile().ainvoke({"trace": []}, {"recursion_limit": 40})
-        report, failed = st.get("report"), st.get("failed")
-        ok = bool(report and report.investigation_complete and not failed)
-        per_round: dict[int, int] = {}
-        for t in self.box.trace:
-            per_round[t["round"]] = per_round.get(t["round"], 0) + 1
-        return InvestigationResult(
-            self.incident_id, "investigated" if ok else "inconclusive", report,
-            list(self.labels.values()), self.box.trace,
-            error=failed or (None if ok else str(st.get("exhausted") or "evidence insufficient")),
-            marker=f"system-two-v1 route={self.meta.route or 'n/a'}",
-            extras={"agent_trace": st["trace"], "calls_per_round": per_round,
-                    "duration_s": round(self.s.clock() - t0, 3), "llm": self.meta.as_dict(),
-                    "rejected_queries": self.rejected})
-
+        return await g.compile().ainvoke({"trace": []}, {"recursion_limit": 40})

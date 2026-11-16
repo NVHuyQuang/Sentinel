@@ -2,39 +2,20 @@
 
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import httpx
 import pytest
 
 from services.decision_engine.providers.base import (
-    IncidentFeatures,
     ProviderError,
-    ServiceSignalWindow,
 )
 from services.investigation.graph import SystemTwo, _free_text_queries
 from services.investigation.llm import ChatClient
 from services.investigation.toolbox import RoundBudgetExceeded, ToolBox, ToolBudgetExceeded
-from services.telemetry.backend import METRIC_ALLOWLIST, SnapshotBackend, parse_ts
+from services.telemetry.backend import METRIC_ALLOWLIST, SnapshotBackend
 from simulator.recorder import forbidden_terms
-from tests.llm_doubles import INJECTION, ScriptedLLM
-
-NOW = parse_ts("2026-11-06T03:11:30Z")
-
-
-def _w(svc: str) -> ServiceSignalWindow:
-    return ServiceSignalWindow(
-        service=svc, window_start=NOW - timedelta(minutes=1), window_end=NOW, request_rate=15,
-        error_rate=0.4, latency_p50_ms=100, latency_p95_ms=2100, latency_p99_ms=2200,
-        cpu_utilization=0.3, memory_utilization=0.5)
-
-
-FEATURES = IncidentFeatures(
-    candidate_id="inc-1", opened_at=NOW, primary_service="order-service",
-    affected_services=["order-service", "api-gateway"],
-    windows=[_w("order-service"), _w("order-service"), _w("api-gateway"), _w("api-gateway")],
-    detector_scores={"statistical": 1.0}, anomaly_score=0.8, symptom_tags=["error_up"])
+from tests.llm_doubles import FEATURES, INJECTION, NOW, ScriptedLLM
 
 
 @pytest.fixture
@@ -152,7 +133,8 @@ async def test_tool_output_injection_is_data_not_instruction(backend):
 
 async def test_llm_outage_ends_inconclusive_without_canned_answer(backend):
     res = await _run(ScriptedLLM("dead"), backend)
-    assert res.outcome == "inconclusive" and res.report is None and not res.evidence
+    assert res.outcome == "inconclusive" and res.report is None
+    assert [e.source_type for e in res.evidence] == ["incident_summary"]  # no tool evidence
     assert "llm unavailable" in res.error
 
 
@@ -209,6 +191,3 @@ async def test_chat_client_caches_records_usage_and_maps_errors(tmp_path):
     with pytest.raises(ProviderError, match="unavailable"):
         await _chat(lambda r: httpx.Response(503)).complete("s", "u3")
 
-
-def test_clock_type_is_utc():
-    assert isinstance(NOW, datetime) and NOW.tzinfo == timezone.utc
